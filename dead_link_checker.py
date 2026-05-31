@@ -3,6 +3,8 @@ import json
 import re
 import argparse
 import sys
+import socket
+import ipaddress
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -61,18 +63,48 @@ def extract_urls_from_text(file_path):
         print(f"Error reading Text/Markdown {file_path}: {e}", file=sys.stderr)
     return urls
 
+def is_safe_url(url):
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+            
+        if hostname.lower() in ('localhost', 'metadata.google.internal', '169.254.169.254'):
+            return False
+            
+        ip_addr = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_addr)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return False
+        return True
+    except Exception:
+        return False
+
 def check_url(url, timeout=10):
+    if not is_safe_url(url):
+        return url, False, None, "Unsafe URL (metadata or local IP) blocked"
+        
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         # First try HEAD request for efficiency
-        response = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
-        if response.status_code >= 400 and response.status_code != 405:
+        with requests.head(url, timeout=timeout, allow_redirects=True, headers=headers) as response:
+            status_code = response.status_code
+            reason = response.reason
+            
+        if status_code >= 400:
             # Fallback to GET if HEAD fails or gives error (some servers block HEAD)
-            response = requests.get(url, timeout=timeout, stream=True, headers=headers)
+            with requests.get(url, timeout=timeout, stream=True, headers=headers) as response:
+                status_code = response.status_code
+                reason = response.reason
+                # Fully close the stream without downloading the body to prevent leaks
+                response.close()
         
-        if response.status_code >= 400:
-            return url, False, response.status_code, response.reason
-        return url, True, response.status_code, "OK"
+        if status_code >= 400:
+            return url, False, status_code, reason
+        return url, True, status_code, "OK"
     except requests.exceptions.RequestException as e:
         return url, False, None, str(e)
 
